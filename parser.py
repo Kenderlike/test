@@ -5,8 +5,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from bs4 import BeautifulSoup
-from playwright.sync_api import sync_playwright
-from playwright_stealth import stealth_sync
+from curl_cffi import requests as cf_requests
 
 HERE = Path(__file__).resolve().parent
 PRICES_PATH = HERE / "prices.json"
@@ -23,14 +22,18 @@ CATEGORIES = [
 ]
 UNTRADABLE_CATEGORIES = {"untradables"}
 
+MIN_ITEMS_SANITY = 50
+DELAY_MIN_SECONDS = 2
+DELAY_MAX_SECONDS = 4
+
+PAREN_SUFFIX_RE = re.compile(r"\s*\([^)]*\)\s*$")
+TRAILING_WEAPON_RE = re.compile(r"[\s\-–—]*(gun|knife)\s*$", re.IGNORECASE)
 VALUE_PREFIX_RE = re.compile(r"^value\s*[-–—:]\s*", re.IGNORECASE)
 STABILITY_SPLIT_RE = re.compile(r"\s+stability\b", re.IGNORECASE)
 RARITY_WORDS_RE = re.compile(
     r"\b(legendaries|legendary|rares|rare|uncommons|uncommon|commons|common)\b",
     re.IGNORECASE
 )
-PAREN_SUFFIX_RE = re.compile(r"\s*\([^)]*\)\s*$")
-TRAILING_WEAPON_RE = re.compile(r"[\s\-–—]*(gun|knife)\s*$", re.IGNORECASE)
 
 
 def make_soup(markup):
@@ -43,9 +46,9 @@ def make_soup(markup):
 def norm_name(text):
     if not text:
         return ""
-    s = text.lower().strip()
-    s = PAREN_SUFFIX_RE.sub("", s)
-    s = TRAILING_WEAPON_RE.sub("", s)
+    s = str(text).lower().strip()
+    s = PAREN_SUFFIX_RE.sub("", s).strip()
+    s = TRAILING_WEAPON_RE.sub("", s).strip()
     s = re.sub(r"^c\.\s*", "chroma ", s)
     s = s.replace("'", "").replace("’", "").replace("-", " ")
     return " ".join(s.split())
@@ -76,7 +79,7 @@ def extract_value(col):
     return None
 
 
-def detect_weapon_type(raw_name, col):
+def detect_weapon_from_col(raw_name, col):
     text = (raw_name + " " + " ".join(col.get("class", []))).lower()
     if "knife" in text:
         return "Knife"
@@ -85,141 +88,111 @@ def detect_weapon_type(raw_name, col):
     return None
 
 
-def parse_site_items():
-    parsed_items = []
-
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-            ]
-        )
-        context = browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            viewport={"width": 1920, "height": 1080},
-            locale="en-US"
-        )
-        page = context.new_page()
-        stealth_sync(page)
-
-        # Прогрев: открываем главную страницу для прохождения челленджа и получения куки Cloudflare
-        print("[browser] Открытие главной страницы для прохождения проверки Cloudflare...")
-        try:
-            page.goto("https://supremevalues.com/", wait_until="load", timeout=30000)
-            time.sleep(5)
-        except Exception as e:
-            print(f"[browser] Варнинг при открытии главной: {e}")
-
-        for cat in CATEGORIES:
-            url = f"{BASE_PREFIX}{cat}"
-            print(f"[browser] Загрузка {url} ...")
+def scrape():
+    items = []
+    with cf_requests.Session() as session:
+        for i, category in enumerate(CATEGORIES):
+            if i > 0:
+                time.sleep(random.uniform(DELAY_MIN_SECONDS, DELAY_MAX_SECONDS))
+            url = f"{BASE_PREFIX}{category}"
+            untradable = category in UNTRADABLE_CATEGORIES
             try:
-                page.goto(url, wait_until="domcontentloaded", timeout=40000)
-                # Ждем либо появления элементов каталога, либо 8 секунд
-                for _ in range(8):
-                    if page.locator(".itemcolumn").count() > 0:
-                        break
-                    time.sleep(1)
-            except Exception as e:
-                print(f"[browser] Ошибка при переходе на {cat}: {e}")
+                resp = session.get(url, impersonate="chrome", timeout=30)
+                if resp.status_code != 200:
+                    print(f"[{category}] статус {resp.status_code}")
+                    continue
+            except Exception as exc:
+                print(f"[{category}] ошибка: {exc}")
+                continue
 
-            html = page.content()
-            soup = make_soup(html)
-            cols = soup.select(".itemcolumn")
+            soup = make_soup(resp.text)
             count = 0
-
-            for col in cols:
+            for col in soup.select(".itemcolumn"):
                 name_el = col.select_one(".itemhead")
                 if not name_el:
                     continue
                 raw_name = name_el.get_text(" ", strip=True)
-                val = "untradable" if cat in UNTRADABLE_CATEGORIES else extract_value(col) or "untradable"
-                w_type = detect_weapon_type(raw_name, col)
-                is_chroma = "chroma" in raw_name.lower() or "chromas" in cat.lower()
+                val = "untradable" if untradable else extract_value(col) or "untradable"
+                w_type = detect_weapon_from_col(raw_name, col)
+                is_chroma = "chroma" in raw_name.lower() or category == "chromas"
 
-                parsed_items.append({
+                items.append({
                     "raw_name": raw_name,
-                    "norm_name": norm_name(raw_name),
+                    "norm": norm_name(raw_name),
                     "value": val,
-                    "category": cat,
                     "type": w_type,
-                    "is_chroma": is_chroma
+                    "is_chroma": is_chroma,
+                    "category": category
                 })
                 count += 1
-
-            print(f"[browser] {cat}: найдено {count} предметов")
-            time.sleep(random.uniform(1.0, 2.0))
-
-        browser.close()
-
-    return parsed_items
+            print(f"[{category}] спарсено: {count}")
+    return items
 
 
-def build_final_database(site_items):
+def match_with_game(site_items):
     if not GAME_DUMP_PATH.exists():
-        raise FileNotFoundError(f"Файл {GAME_DUMP_PATH} не найден!")
+        print(f"Внимание: {GAME_DUMP_PATH} не найден, сохраняем только плоский список")
+        return {"by_asset": {}, "by_code": {}}
 
     game_dump = json.loads(GAME_DUMP_PATH.read_text(encoding="utf-8"))
-
     by_asset = {}
     by_code = {}
     matched = 0
 
     for code_id, info in game_dump.items():
-        item_name = info.get("ItemName", "")
-        item_type = info.get("ItemType", "")
-        is_chroma = bool(info.get("Chroma", False))
-        year = str(info.get("Year", ""))
-        clean_g_name = norm_name(item_name)
+        g_name = norm_name(info.get("ItemName", ""))
+        g_type = info.get("ItemType", "")
+        g_chroma = bool(info.get("Chroma", False))
         asset_id = extract_asset_id(info.get("Image"))
 
-        best_val = None
-        for s_item in site_items:
-            if s_item["norm_name"] != clean_g_name:
-                continue
-
-            if s_item["is_chroma"] != is_chroma:
-                continue
-
-            if s_item["type"] and item_type and s_item["type"] != item_type:
-                continue
-
-            if year and year in s_item["raw_name"]:
-                best_val = s_item["value"]
+        # Ищем совпадение
+        val = None
+        for s in site_items:
+            if s["norm"] == g_name:
+                # Если скин хрома в игре — на сайте тоже должна быть хрома
+                if g_chroma != s["is_chroma"]:
+                    continue
+                # Если у обоих известен тип (нож/пистолет) — сверяем его
+                if s["type"] and g_type and s["type"] != g_type:
+                    continue
+                val = s["value"]
                 break
 
-            best_val = s_item["value"]
-            break
+        # Запасной поиск: без строгого типа, если не нашлось
+        if not val:
+            for s in site_items:
+                if s["norm"] == g_name and g_chroma == s["is_chroma"]:
+                    val = s["value"]
+                    break
 
-        if best_val:
+        if val:
             matched += 1
-            by_code[code_id] = best_val
+            by_code[code_id] = val
             if asset_id:
-                by_asset[asset_id] = best_val
+                by_asset[asset_id] = val
 
-    print(f"[matcher] Успешно сматчено скинов: {matched} из {len(game_dump)}")
+    print(f"Итого сматчено со скинами игры: {matched} из {len(game_dump)}")
     return {"by_asset": by_asset, "by_code": by_code}
 
 
 def main():
-    print("[main] Парсим SupremeValues через Stealth Playwright...")
-    site_items = parse_site_items()
-    print(f"[main] Всего спарсено с сайта: {len(site_items)} записей")
+    site_items = scrape()
+    print(f"Всего получено предметов с сайта: {len(site_items)}")
+    if len(site_items) < MIN_ITEMS_SANITY:
+        print("Слишком мало предметов, отмена записи.")
+        return
 
-    print("[main] Связываем с кодовой базой MM2...")
-    result = build_final_database(site_items)
+    result = match_with_game(site_items)
 
     now = datetime.now(timezone.utc)
     PRICES_PATH.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
     META_PATH.write_text(json.dumps({
         "updatedAt": now.isoformat(),
         "total_assets": len(result["by_asset"]),
-        "total_codes": len(result["by_code"])
+        "total_codes": len(result["by_code"]),
+        "site_items": len(site_items)
     }, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"[done] Цены сохранены в {PRICES_PATH}")
+    print(f"Готово! База записана в {PRICES_PATH}")
 
 
 if __name__ == "__main__":
