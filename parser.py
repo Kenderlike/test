@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
+from playwright_stealth import stealth_sync
 
 HERE = Path(__file__).resolve().parent
 PRICES_PATH = HERE / "prices.json"
@@ -93,28 +94,39 @@ def parse_site_items():
             args=[
                 "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
-                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
             ]
         )
         context = browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-            viewport={"width": 1920, "height": 1080}
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            viewport={"width": 1920, "height": 1080},
+            locale="en-US"
         )
         page = context.new_page()
+        stealth_sync(page)
+
+        # Прогрев: открываем главную страницу для прохождения челленджа и получения куки Cloudflare
+        print("[browser] Открытие главной страницы для прохождения проверки Cloudflare...")
+        try:
+            page.goto("https://supremevalues.com/", wait_until="load", timeout=30000)
+            time.sleep(5)
+        except Exception as e:
+            print(f"[browser] Варнинг при открытии главной: {e}")
 
         for cat in CATEGORIES:
             url = f"{BASE_PREFIX}{cat}"
             print(f"[browser] Загрузка {url} ...")
             try:
-                page.goto(url, wait_until="domcontentloaded", timeout=45000)
-                # Ждем появления элементов каталога
-                page.wait_for_selector(".itemcolumn", timeout=15000)
-                time.sleep(2)
-                html = page.content()
+                page.goto(url, wait_until="domcontentloaded", timeout=40000)
+                # Ждем либо появления элементов каталога, либо 8 секунд
+                for _ in range(8):
+                    if page.locator(".itemcolumn").count() > 0:
+                        break
+                    time.sleep(1)
             except Exception as e:
-                print(f"[browser] Ошибка загрузки {cat}: {e}")
-                html = page.content()
+                print(f"[browser] Ошибка при переходе на {cat}: {e}")
 
+            html = page.content()
             soup = make_soup(html)
             cols = soup.select(".itemcolumn")
             count = 0
@@ -138,8 +150,8 @@ def parse_site_items():
                 })
                 count += 1
 
-            print(f"[browser] {cat}: успешно найдено {count} предметов")
-            time.sleep(random.uniform(1.0, 2.5))
+            print(f"[browser] {cat}: найдено {count} предметов")
+            time.sleep(random.uniform(1.0, 2.0))
 
         browser.close()
 
@@ -193,7 +205,7 @@ def build_final_database(site_items):
 
 
 def main():
-    print("[main] Парсим SupremeValues через Playwright...")
+    print("[main] Парсим SupremeValues через Stealth Playwright...")
     site_items = parse_site_items()
     print(f"[main] Всего спарсено с сайта: {len(site_items)} записей")
 
