@@ -129,47 +129,125 @@ def scrape():
     return items
 
 
+# Таблица соответствия редкостей игры и категорий сайта
+RARITY_MAP = {
+    "common": {"commons", "collectibles"},
+    "uncommon": {"uncommons", "collectibles"},
+    "rare": {"rares", "collectibles"},
+    "legendary": {"legendaries", "collectibles"},
+    "godly": {"godlies", "chromas"},
+    "ancient": {"ancients", "evos"},
+    "classic": {"vintages"},
+    "vintage": {"vintages"},
+    "unique": {"uniques"}
+}
+
+RARITY_MAP = {
+    "common": {"commons", "collectibles"},
+    "uncommon": {"uncommons", "collectibles"},
+    "rare": {"rares", "collectibles"},
+    "legendary": {"legendaries", "collectibles"},
+    "godly": {"godlies", "chromas"},
+    "ancient": {"ancients", "chromas", "evos"},
+    "classic": {"vintages"},
+    "vintage": {"vintages"},
+    "unique": {"uniques"}
+}
+
+MISSING_PATH = HERE / "missing.txt"
+
+RARITY_MAP = {
+    "common": {"commons", "collectibles"},
+    "uncommon": {"uncommons", "collectibles"},
+    "rare": {"rares", "collectibles"},
+    "legendary": {"legendaries", "collectibles"},
+    "godly": {"godlies", "chromas"},
+    "ancient": {"ancients", "chromas", "evos"},
+    "classic": {"vintages"},
+    "vintage": {"vintages"},
+    "unique": {"uniques"}
+}
+
 def match_with_game(site_items):
     if not GAME_DUMP_PATH.exists():
-        print(f"Внимание: {GAME_DUMP_PATH} не найден, сохраняем только плоский список")
         return {"by_asset": {}, "by_code": {}}
 
     game_dump = json.loads(GAME_DUMP_PATH.read_text(encoding="utf-8"))
     by_asset = {}
     by_code = {}
     matched = 0
+    unmatched_list = []
 
     for code_id, info in game_dump.items():
         g_name = norm_name(info.get("ItemName", ""))
+
+        # Полный игнор любых вариаций Bats (ножи, пистолеты всех годов)
+        if "bats" in g_name:
+            continue
+
         g_type = info.get("ItemType", "")
         g_chroma = bool(info.get("Chroma", False))
+        g_rarity = str(info.get("Rarity", "")).lower()
+        year = str(info.get("Year", "")).strip()
         asset_id = extract_asset_id(info.get("Image"))
 
-        # Ищем совпадение
+        allowed_categories = RARITY_MAP.get(g_rarity, set()) | {"collectibles", "misc", "untradables"}
+        if g_chroma:
+            allowed_categories.add("chromas")
+
+        g_base = re.sub(r"^chroma\s+", "", g_name).strip()
+        short_year = year[-2:] if len(year) == 4 else year
+
         val = None
-        for s in site_items:
-            if s["norm"] == g_name:
-                # Если скин хрома в игре — на сайте тоже должна быть хрома
+
+        # 1. Поиск с учетом года
+        if year:
+            for s in site_items:
+                s_base = re.sub(r"^chroma\s+", "", s["norm"]).strip()
+                s_raw = s["raw_name"].lower()
+
+                if (year in s_raw or f"'{short_year}" in s_raw) and g_base in s_base:
+                    if g_chroma != s["is_chroma"]:
+                        continue
+                    if s["type"] and g_type and s["type"] != g_type:
+                        continue
+                    val = s["value"]
+                    break
+
+        # 2. Поиск по имени и категории
+        if not val:
+            for s in site_items:
+                s_base = re.sub(r"^chroma\s+", "", s["norm"]).strip()
+                if s_base != g_base:
+                    continue
                 if g_chroma != s["is_chroma"]:
                     continue
-                # Если у обоих известен тип (нож/пистолет) — сверяем его
+                if s["category"] not in allowed_categories:
+                    continue
                 if s["type"] and g_type and s["type"] != g_type:
                     continue
                 val = s["value"]
                 break
 
-        # Запасной поиск: без строгого типа, если не нашлось
+        # 3. Запасной поиск без строгого совпадения типа оружия
         if not val:
             for s in site_items:
-                if s["norm"] == g_name and g_chroma == s["is_chroma"]:
-                    val = s["value"]
-                    break
+                s_base = re.sub(r"^chroma\s+", "", s["norm"]).strip()
+                if s_base == g_base and g_chroma == s["is_chroma"]:
+                    if s["category"] in allowed_categories:
+                        val = s["value"]
+                        break
 
         if val:
             matched += 1
             by_code[code_id] = val
             if asset_id:
                 by_asset[asset_id] = val
+        else:
+            unmatched_list.append(f"{code_id} | Name: {info.get('ItemName')} | Type: {g_type} | Rarity: {g_rarity} | Year: {year}")
+
+    if MISSING_PATH:
+        MISSING_PATH.write_text("\n".join(unmatched_list), encoding="utf-8")
 
     print(f"Итого сматчено со скинами игры: {matched} из {len(game_dump)}")
     return {"by_asset": by_asset, "by_code": by_code}
