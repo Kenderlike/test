@@ -1,6 +1,8 @@
 import json
+import os
 import random
 import re
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -11,6 +13,7 @@ HERE = Path(__file__).resolve().parent
 PRICES_PATH = HERE / "prices.json"
 META_PATH = HERE / "meta.json"
 GAME_DUMP_PATH = HERE / "mm2_items_dump.json"
+MISSING_PATH = HERE / "missing.txt"
 
 BASE_PREFIX = "https://supremevalues.com/mm2/"
 
@@ -34,6 +37,18 @@ RARITY_WORDS_RE = re.compile(
     r"\b(legendaries|legendary|rares|rare|uncommons|uncommon|commons|common)\b",
     re.IGNORECASE
 )
+
+RARITY_MAP = {
+    "common": {"commons", "collectibles"},
+    "uncommon": {"uncommons", "collectibles"},
+    "rare": {"rares", "collectibles"},
+    "legendary": {"legendaries", "collectibles"},
+    "godly": {"godlies", "chromas"},
+    "ancient": {"ancients", "chromas", "evos"},
+    "classic": {"vintages"},
+    "vintage": {"vintages"},
+    "unique": {"uniques"},
+}
 
 
 def make_soup(markup):
@@ -88,85 +103,109 @@ def detect_weapon_from_col(raw_name, col):
     return None
 
 
-def scrape():
+def parse_category_html(html, category):
+    untradable = category in UNTRADABLE_CATEGORIES
+    soup = make_soup(html)
+    parsed = []
+    for col in soup.select(".itemcolumn"):
+        name_el = col.select_one(".itemhead")
+        if not name_el:
+            continue
+        raw_name = name_el.get_text(" ", strip=True)
+        val = "untradable" if untradable else extract_value(col) or "untradable"
+        w_type = detect_weapon_from_col(raw_name, col)
+        is_chroma = "chroma" in raw_name.lower() or category == "chromas"
+
+        parsed.append({
+            "raw_name": raw_name,
+            "norm": norm_name(raw_name),
+            "value": val,
+            "type": w_type,
+            "is_chroma": is_chroma,
+            "category": category,
+        })
+    return parsed
+
+
+def scrape_with_curl(proxy_url=None):
     items = []
-    with cf_requests.Session() as session:
+    proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
+    headers = {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://supremevalues.com/",
+    }
+
+    with cf_requests.Session(proxies=proxies, headers=headers) as session:
         for i, category in enumerate(CATEGORIES):
             if i > 0:
                 time.sleep(random.uniform(DELAY_MIN_SECONDS, DELAY_MAX_SECONDS))
             url = f"{BASE_PREFIX}{category}"
-            untradable = category in UNTRADABLE_CATEGORIES
             try:
                 resp = session.get(url, impersonate="chrome", timeout=30)
+                if resp.status_code == 403 and i == 0:
+                    print(f"[{category}] статус 403 через curl_cffi — переключаюсь на Camoufox...")
+                    return None
                 if resp.status_code != 200:
                     print(f"[{category}] статус {resp.status_code}")
                     continue
             except Exception as exc:
                 print(f"[{category}] ошибка: {exc}")
+                if i == 0:
+                    return None
                 continue
 
-            soup = make_soup(resp.text)
-            count = 0
-            for col in soup.select(".itemcolumn"):
-                name_el = col.select_one(".itemhead")
-                if not name_el:
-                    continue
-                raw_name = name_el.get_text(" ", strip=True)
-                val = "untradable" if untradable else extract_value(col) or "untradable"
-                w_type = detect_weapon_from_col(raw_name, col)
-                is_chroma = "chroma" in raw_name.lower() or category == "chromas"
-
-                items.append({
-                    "raw_name": raw_name,
-                    "norm": norm_name(raw_name),
-                    "value": val,
-                    "type": w_type,
-                    "is_chroma": is_chroma,
-                    "category": category
-                })
-                count += 1
-            print(f"[{category}] спарсено: {count}")
+            cat_items = parse_category_html(resp.text, category)
+            items.extend(cat_items)
+            print(f"[{category}] спарсено: {len(cat_items)}")
     return items
 
 
-# Таблица соответствия редкостей игры и категорий сайта
-RARITY_MAP = {
-    "common": {"commons", "collectibles"},
-    "uncommon": {"uncommons", "collectibles"},
-    "rare": {"rares", "collectibles"},
-    "legendary": {"legendaries", "collectibles"},
-    "godly": {"godlies", "chromas"},
-    "ancient": {"ancients", "evos"},
-    "classic": {"vintages"},
-    "vintage": {"vintages"},
-    "unique": {"uniques"}
-}
+def scrape_with_camoufox(proxy_url=None):
+    from camoufox.sync_api import Camoufox
 
-RARITY_MAP = {
-    "common": {"commons", "collectibles"},
-    "uncommon": {"uncommons", "collectibles"},
-    "rare": {"rares", "collectibles"},
-    "legendary": {"legendaries", "collectibles"},
-    "godly": {"godlies", "chromas"},
-    "ancient": {"ancients", "chromas", "evos"},
-    "classic": {"vintages"},
-    "vintage": {"vintages"},
-    "unique": {"uniques"}
-}
+    items = []
+    headless_mode = "virtual" if os.name != "nt" else True
+    proxy_cfg = None
+    if proxy_url:
+        proxy_cfg = {"server": proxy_url.replace("socks5h://", "socks5://")}
 
-MISSING_PATH = HERE / "missing.txt"
+    def run_browser(p_cfg):
+        collected = []
+        with Camoufox(headless=headless_mode, proxy=p_cfg) as browser:
+            page = browser.new_page()
+            for i, category in enumerate(CATEGORIES):
+                if i > 0:
+                    time.sleep(random.uniform(DELAY_MIN_SECONDS, DELAY_MAX_SECONDS))
+                url = f"{BASE_PREFIX}{category}"
+                try:
+                    page.goto(url, wait_until="domcontentloaded", timeout=45000)
+                    page.wait_for_selector(".itemcolumn", timeout=25000)
+                    html = page.content()
+                    cat_items = parse_category_html(html, category)
+                    collected.extend(cat_items)
+                    print(f"[{category}] (Camoufox) спарсено: {len(cat_items)}")
+                except Exception as exc:
+                    print(f"[{category}] (Camoufox) ошибка: {exc}")
+        return collected
 
-RARITY_MAP = {
-    "common": {"commons", "collectibles"},
-    "uncommon": {"uncommons", "collectibles"},
-    "rare": {"rares", "collectibles"},
-    "legendary": {"legendaries", "collectibles"},
-    "godly": {"godlies", "chromas"},
-    "ancient": {"ancients", "chromas", "evos"},
-    "classic": {"vintages"},
-    "vintage": {"vintages"},
-    "unique": {"uniques"}
-}
+    items = run_browser(proxy_cfg)
+    if not items and proxy_cfg:
+        print("Пробуем Camoufox напрямую без прокси...")
+        items = run_browser(None)
+    return items
+
+
+def scrape():
+    proxy_url = os.environ.get("PROXY_URL", "").strip() or None
+    if proxy_url:
+        print(f"Используется прокси: {proxy_url}")
+
+    items = scrape_with_curl(proxy_url)
+    if items is None or len(items) < MIN_ITEMS_SANITY:
+        items = scrape_with_camoufox(proxy_url)
+    return items
+
 
 def match_with_game(site_items):
     if not GAME_DUMP_PATH.exists():
@@ -181,7 +220,6 @@ def match_with_game(site_items):
     for code_id, info in game_dump.items():
         g_name = norm_name(info.get("ItemName", ""))
 
-        # Полный игнор любых вариаций Bats (ножи, пистолеты всех годов)
         if "bats" in g_name:
             continue
 
@@ -200,7 +238,6 @@ def match_with_game(site_items):
 
         val = None
 
-        # 1. Поиск с учетом года
         if year:
             for s in site_items:
                 s_base = re.sub(r"^chroma\s+", "", s["norm"]).strip()
@@ -214,7 +251,6 @@ def match_with_game(site_items):
                     val = s["value"]
                     break
 
-        # 2. Поиск по имени и категории
         if not val:
             for s in site_items:
                 s_base = re.sub(r"^chroma\s+", "", s["norm"]).strip()
@@ -229,7 +265,6 @@ def match_with_game(site_items):
                 val = s["value"]
                 break
 
-        # 3. Запасной поиск без строгого совпадения типа оружия
         if not val:
             for s in site_items:
                 s_base = re.sub(r"^chroma\s+", "", s["norm"]).strip()
@@ -244,7 +279,9 @@ def match_with_game(site_items):
             if asset_id:
                 by_asset[asset_id] = val
         else:
-            unmatched_list.append(f"{code_id} | Name: {info.get('ItemName')} | Type: {g_type} | Rarity: {g_rarity} | Year: {year}")
+            unmatched_list.append(
+                f"{code_id} | Name: {info.get('ItemName')} | Type: {g_type} | Rarity: {g_rarity} | Year: {year}"
+            )
 
     if MISSING_PATH:
         MISSING_PATH.write_text("\n".join(unmatched_list), encoding="utf-8")
@@ -258,7 +295,7 @@ def main():
     print(f"Всего получено предметов с сайта: {len(site_items)}")
     if len(site_items) < MIN_ITEMS_SANITY:
         print("Слишком мало предметов, отмена записи.")
-        return
+        sys.exit(1)
 
     result = match_with_game(site_items)
 
@@ -268,7 +305,7 @@ def main():
         "updatedAt": now.isoformat(),
         "total_assets": len(result["by_asset"]),
         "total_codes": len(result["by_code"]),
-        "site_items": len(site_items)
+        "site_items": len(site_items),
     }, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"Готово! База записана в {PRICES_PATH}")
 
